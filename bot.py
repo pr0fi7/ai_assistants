@@ -94,7 +94,7 @@ async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     description = await getWhatOnImage(image_bytes)
     # Include any accompanying caption
     caption = update.message.caption or ""
-    combined = description + (f" Caption: {caption}" if caption else "")
+    combined = 'Пользователь отправил фото с следующим описанием' + description + (f"и таким текстом: {caption}" if caption else "")
 
     # Buffer description as user input
     buffer = context.user_data.setdefault('pending_messages', [])
@@ -204,7 +204,10 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         frames_desc.append(f"At {t}s: {desc}")
 
     # 6) Buffer up a single combined message
-    combined = f"Video audio: {transcription}\n" + "\n".join(frames_desc)
+    combined = f"Пользователь отправил видео с в котором он говорит: {transcription}\n"
+    combined += "\n и на котором видно:\n"
+    combined += "\n".join(frames_desc)
+    combined += "\n\n" + (update.message.caption or "")
     pending = context.user_data.setdefault("pending_messages", [])
     pending.append(combined)
     if not context.user_data.get("pending_task"):
