@@ -3,40 +3,36 @@ import os
 import random
 import asyncio
 from dotenv import load_dotenv
+
 from telegram import Update
-from telegram.ext import Application, MessageHandler, filters, ContextTypes
-# Import your multi-agent chat function
+from telegram.ext import (
+    Application,
+    MessageHandler,
+    filters,
+    ContextTypes,
+    # we need Update again for allowed_updates
+)
+
+# your imports…
 from test import multi_agent_chat
 from utils import getWhatOnImage, getWhatonAudio
-from telegram.ext import Application, MessageHandler, filters, ContextTypes
-from pydub import AudioSegment
-import io
 from openai import BadRequestError
-
+from pydub import AudioSegment
+import io, tempfile
 import moviepy as mp
-import tempfile
 from PIL import Image
 
-
-# Load environment variables
 load_dotenv()
 TOKEN = os.getenv("TOKEN")
 
-# Set up logging
 def setup_logging():
     logging.basicConfig(
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", 
         level=logging.INFO
     )
-    logger = logging.getLogger(__name__)
-    logger.setLevel(logging.INFO)
+    logging.getLogger(__name__).setLevel(logging.INFO)
 
-# Utility to maybe split long assistant replies
 def maybe_split(text: str, split_chance: float = 0.3):
-    """
-    With probability `split_chance`, split `text` on sentence or newline boundaries.
-    Otherwise, return [text] as a single chunk.
-    """
     if random.random() > split_chance:
         return [text]
     parts = __import__('re').split(r'(?<=[\.\!?])\s+|\n', text)
@@ -44,94 +40,142 @@ def maybe_split(text: str, split_chance: float = 0.3):
     return parts if len(parts) >= 2 else [text]
 
 async def process_pending(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
-    # Wait to batch multi-turn user messages
     await asyncio.sleep(10)
     pending = context.user_data.pop('pending_messages', [])
     context.user_data.pop('pending_task', None)
     if not pending:
         return
 
-    # Combine all buffered user prompts
-    user_prompt = "\n".join(pending)
-    # Call your multi-agent function once
+    # … your multi-agent call …
     conv, phone_flag = multi_agent_chat(
-        user_prompt=user_prompt,
+        user_prompt="\n".join(pending),
         conversation=context.user_data.get('conversation'),
         phone_number=context.user_data.get('phone_number_received', False)
     )
-    # Save state
     context.user_data['conversation'] = conv
     context.user_data['phone_number_received'] = phone_flag
 
-    # Send assistant reply in chunks
+    # **If there was a business_connection_id stashed, grab it here:**
+    business_conn = context.user_data.pop('business_connection_id', None)
+    extra = {}
+    if business_conn:
+        extra['business_connection_id'] = business_conn
+
+    # Send assistant reply in chunks, including business_connection_id if needed
     last_message = conv[-1]['content']
-    parts = maybe_split(last_message, split_chance=0.3)
-    for part in parts:
-        await context.bot.send_message(chat_id, part)
+    for part in maybe_split(last_message, split_chance=0.3):
+        await context.bot.send_message(chat_id, part, **extra)
         await asyncio.sleep(random.uniform(1.0, 3.0))
 
+
 async def echo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    text = update.message.text.strip()
-    if not text:
+    # **Use effective_message so that business_message → .effective_message**
+    if update.business_message:
+        logging.info("GOT BUSINESS_MESSAGE, conn_id=%s", 
+                    update.business_message.business_connection_id)
+
+    msg = update.effective_message  
+    if not msg or not msg.text:
         return
-    # Buffer incoming user messages
+
+    # **If this was a business_message, stash its connection ID**  
+    if update.business_message:
+        context.user_data['business_connection_id'] = msg.business_connection_id
+
+    # Buffer and schedule exactly as before
     buffer = context.user_data.setdefault('pending_messages', [])
-    buffer.append(text)
-    # Schedule batching if not already scheduled
+    buffer.append(msg.text.strip())
     if not context.user_data.get('pending_task'):
-        task = asyncio.create_task(process_pending(context, update.effective_chat.id))
-        context.user_data['pending_task'] = task
+        context.user_data['pending_task'] = asyncio.create_task(
+            process_pending(context, update.effective_chat.id)
+        )
+
 
 async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    # Debug log
+    if update.business_message:
+        logging.info(
+            "GOT BUSINESS_MESSAGE, conn_id=%s", 
+            update.business_message.business_connection_id
+        )
+
+    # Grab the Message object (works for both normal & business)
+    msg = update.effective_message  
+
+    # If it’s a business message, stash the connection ID
+    if update.business_message:
+        context.user_data['business_connection_id'] = msg.business_connection_id
+
     # Download the highest-resolution photo sent
-    photo = update.message.photo
+    photo = msg.photo
     if not photo:
         return
-    file_id = photo[-1].file_id
-    file = await context.bot.get_file(file_id)
+    file = await context.bot.get_file(photo[-1].file_id)
     image_bytes = await file.download_as_bytearray()
-    # Describe the image (await the coroutine)
+
+    # Describe the image
     description = await getWhatOnImage(image_bytes)
-    # Include any accompanying caption
-    caption = update.message.caption or ""
-    combined = 'Пользователь отправил фото с следующим описанием' + description + (f"и таким текстом: {caption}" if caption else "")
+
+    # **Use msg.caption** instead of update.message.caption
+    caption = msg.caption or ""
+
+    combined = (
+        "Пользователь отправил фото с следующим описанием: "
+        + description
+        + (f" и таким текстом: {caption}" if caption else "")
+    )
 
     # Buffer description as user input
     buffer = context.user_data.setdefault('pending_messages', [])
     buffer.append(combined)
     if not context.user_data.get('pending_task'):
-        task = asyncio.create_task(process_pending(context, update.effective_chat.id))
-        context.user_data['pending_task'] = task
+        context.user_data['pending_task'] = asyncio.create_task(
+            process_pending(context, msg.chat.id)
+        )
 
 async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    # Handle both voice notes (.oga) and uploaded audio files
-    media = update.message.voice or update.message.audio
+    # Log for debugging
+    if update.business_message:
+        logging.info(
+            "GOT BUSINESS_MESSAGE, conn_id=%s",
+            update.business_message.business_connection_id
+        )
+
+    # Grab the actual Message object (works for both normal & business)
+    msg = update.effective_message
+
+    # If it's a business message, stash its connection_id
+    if update.business_message:
+        context.user_data['business_connection_id'] = msg.business_connection_id
+
+    # Now handle voice or audio attachments
+    media = msg.voice or msg.audio
     if not media:
         return
+
     file = await context.bot.get_file(media.file_id)
     raw_bytes = await file.download_as_bytearray()
 
-    # Convert to WAV (PCM 16-bit) for OpenAI transcription
+    # Convert to WAV for transcription
     try:
-        # Let pydub auto-detect format; codec ensures compatible WAV
-        audio_seg = AudioSegment.from_file(io.BytesIO(bytes(raw_bytes)))
+        audio_seg = AudioSegment.from_file(io.BytesIO(raw_bytes))
         buf = io.BytesIO()
         audio_seg.export(buf, format='wav', codec='pcm_s16le')
         buf.seek(0)
         wav_io = buf
         wav_io.name = 'audio.wav'
     except FileNotFoundError:
-        logging.error("ffmpeg/ffprobe not found. Audio conversion failed.")
+        logging.error("ffmpeg/ffprobe not found.")
         await context.bot.send_message(
-            update.effective_chat.id,
-            "⚠️ Audio conversion failed. Please install ffmpeg and ensure it's in PATH or set FFMPEG_PATH."
+            msg.chat.id,
+            "⚠️ Audio conversion failed. Please install ffmpeg."
         )
         return
     except Exception as e:
         logging.error(f"Audio conversion error: {e}")
         await context.bot.send_message(
-            update.effective_chat.id,
-            f"⚠️ Audio conversion error: {e}"  
+            msg.chat.id,
+            f"⚠️ Audio conversion error: {e}"
         )
         return
 
@@ -141,21 +185,37 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     except BadRequestError as e:
         logging.error(f"Transcription error: {e}")
         await context.bot.send_message(
-            update.effective_chat.id,
-            f"⚠️ Transcription failed: {e}\nEnsure the audio is clear and in a supported format (WAV/MP3/OGG)."
+            msg.chat.id,
+            f"⚠️ Transcription failed: {e}"
         )
         return
 
-    caption = update.message.caption or ""
-    combined = transcription + (f" Пользователь отправил следующее голосовое сообщение: {caption}" if caption else "")
+    # **Use msg.caption** instead of update.message.caption
+    caption = msg.caption or ""
+    combined = (
+        transcription
+        + (f" Пользователь отправил следующее голосовое сообщение(голосом не текстом): {caption}"
+           if caption else "")
+    )
+
+    # Buffer and schedule batching just like before
     buffer = context.user_data.setdefault('pending_messages', [])
     buffer.append(combined)
     if not context.user_data.get('pending_task'):
         context.user_data['pending_task'] = asyncio.create_task(
-            process_pending(context, update.effective_chat.id)
+            process_pending(context, msg.chat.id)
         )
+
 async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    media = update.message.video or update.message.video_note
+    if update.business_message:
+        logging.info("GOT BUSINESS_MESSAGE, conn_id=%s", 
+                    update.business_message.business_connection_id)
+
+    msg = update.effective_message
+    if update.business_message:
+        context.user_data['business_connection_id'] = msg.business_connection_id
+
+    media = msg.video or msg.video_note
     if not media:
         return
 
@@ -207,26 +267,56 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     combined = f"Пользователь отправил видео с в котором он говорит: {transcription}\n"
     combined += "\n и на котором видно:\n"
     combined += "\n".join(frames_desc)
-    combined += "\n\n" + (update.message.caption or "")
+    combined += "\n\n" + (msg.caption or "")
     pending = context.user_data.setdefault("pending_messages", [])
     pending.append(combined)
     if not context.user_data.get("pending_task"):
         context.user_data["pending_task"] = asyncio.create_task(
-            process_pending(context, update.effective_chat.id)
+            process_pending(context, msg.chat.id)
         )
-
 
 def main():
     setup_logging()
     application = Application.builder().token(TOKEN).build()
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, echo))
-    application.add_handler(MessageHandler(filters.PHOTO & ~filters.COMMAND, handle_image))
+    
+    # Text + Business-Text
     application.add_handler(
-        MessageHandler((filters.VOICE | filters.AUDIO) & ~filters.COMMAND, handle_audio)
+        MessageHandler(
+            (filters.TEXT & ~filters.COMMAND)
+            | (filters.UpdateType.BUSINESS_MESSAGE & filters.TEXT),
+            echo
+        )
     )
-    application.add_handler(MessageHandler((filters.VIDEO | filters.VIDEO_NOTE) & ~filters.COMMAND, handle_video))
 
-    application.run_polling(allowed_updates=Update.ALL_TYPES)   
+    # Photo + Business-Photo
+    application.add_handler(
+        MessageHandler(
+            (filters.PHOTO & ~filters.COMMAND)
+            | (filters.UpdateType.BUSINESS_MESSAGE & filters.PHOTO),
+            handle_image
+        )
+    )
+
+    # Voice/Audio + Business-Voice/Audio
+    application.add_handler(
+        MessageHandler(
+            ((filters.VOICE | filters.AUDIO) & ~filters.COMMAND)
+            | (filters.UpdateType.BUSINESS_MESSAGE & (filters.VOICE | filters.AUDIO)),
+            handle_audio
+        )
+    )
+
+    # Video/VideoNote + Business-Video/VideoNote
+    application.add_handler(
+        MessageHandler(
+            ((filters.VIDEO | filters.VIDEO_NOTE) & ~filters.COMMAND)
+            | (filters.UpdateType.BUSINESS_MESSAGE & (filters.VIDEO | filters.VIDEO_NOTE)),
+            handle_video
+        )
+    )
+
+    # tell Telegram we want *every* update type (including business_message, deleted_business_messages…)
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
     main()
