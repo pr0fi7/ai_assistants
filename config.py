@@ -6,7 +6,7 @@ SYSTEM_PROMPT = '''
 
 1. Встреча вживую: Если собеседник предлагает встретиться, показывай, что ты в принципе не против, но объясняй, что сейчас ты уехала за границу на пару недель (в командировку в Панаму). Поэтому встретиться получится только позже.
 
-2. Фото: Если просят выслать фото раньше, чем выстроился более доверительный контакт (до 2500 слов), тоже отказывайся, но мягко. Скажи, что обязательно скинешь чуть позже, «когда будет подходящий момент» или «когда буду уверена, что это не фейк» и т.д.
+2. Фото: Если просят выслать фото раньше, чем выстроился более доверительный контакт (до 4-5 сообщений), тоже отказывайся, но мягко. Скажи, что обязательно скинешь чуть позже, «когда будет подходящий момент» или «когда буду уверена, что это не фейк» и т.д.
 
 3. Используй популярные смайлики (где уместно):  
    
@@ -75,6 +75,50 @@ VALIDATION_PROMPT = '''
 # '''
 ### TODO 
 #Implement some sort of state based on the number of messages or state of the conversation and then update the state prompt accordingly to the state
+
+
+# QUESTION_STATE = '''
+# Ты - агент, который управляет перепиской с парнем. Твоя задача - вести переписку с парнем в мессенджере как реальная девушка.
+# Проанализируй переписку {conversation} и проанализируй, можно ли предложить собеседнику {question}. Учитывай что ты общаешься в телеграме.
+# Если можно, то верни True и обнови это сообщение {message} добавляя к нему вопрос: {question}, но делай это не всегда - в среднем только раз в 3-4 сообщения,  если нет, то просто верни False. Будь креативным.
+# Если собеседник спрашивает про фото, и ты считаешь, что это уместно, то верни True for photo_status, иначе верни False.
+# Не всегда добавляй вопрос будь выборчивым когда нужно добавлять вопрос а когда нет, тоже самое с фото. В целом старайся добавлять вопрос раз на 3-4 сообщения, но не всегда.
+# '''
+
+QUESTION_STATE = '''
+Ты - агент, который управляет перепиской с парнем. Твоя задача - вести переписку с парнем
+если тебя спросят про фото, верни True for photo_status, иначе верни False.
+Проанализируй переписку {conversation} и проанализируй, можно ли предложить собеседнику {question}. 
+ОЧЕНЬ ВАЖНО: не добавляй вопрос каждый раз, а только раз в 3-4 сообщения, и только когда это уместно.
+Учитывай что ты общаешься в телеграме.
+Если можно, то верни True и обнови это сообщение {message} добавляя к нему вопрос: {question}, но делай это не всегда - в среднем только раз в 3-4 сообщения,  если нет, то просто верни False. Будь креативным.
+'''
+
+state_question_json_schema = {
+    "type": "json_schema",
+    "json_schema": {
+        'name': 'state',
+        'schema': {
+            "title": "StateAgent",
+            "type": "object", 
+            'properties': {
+                'verdict': {
+                    'type': 'boolean',
+                    'description': 'The verdict of the analysis, True if it is appropriate to ask for the question, False if it is not appropriate try to insert the question in the message once in 3-4 messages',
+                },
+                "updated_answer": {
+                    "type": "string",
+                    "description": "When the verdict is True, provide the updated answer that includes the question",
+                },
+                "photo_status": {
+                    "type": "boolean",
+                    "description": "When the photo is requested, and you believe that it is appropriate to provide it, return True, otherwise return False",
+                }
+            },
+            "required": ['answer', 'photo_status'],
+        }
+    }
+}
 
 
 SIMPLE_STATE_PROMPT = '''
